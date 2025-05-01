@@ -107,6 +107,10 @@ func (n *Node) except(c byte) bool {
 	return n.raw[n.parseIdx] == c
 }
 
+func (n *Node) Parse() *Node {
+	return n.parse()
+}
+
 func (n *Node) parse() *Node {
 	if n.parsed {
 		return n
@@ -119,6 +123,10 @@ parse:
 	var skipLB, containsLB bool
 	n.parseIdx, skipLB = skipWhiteSpace(n.raw, n.parseIdx) // 跳过所有的空白字符
 	startIdx := n.parseIdx
+	if n.parseIdx >= len(n.raw) {
+		n.parseErr(n.parseIdx)
+		return n
+	}
 	switch n.raw[n.parseIdx] {
 	case backslash:
 		containsLB = n.parseComment(true, skipLB || containsLB)
@@ -137,6 +145,7 @@ parse:
 		n.Type = Boolean
 		n.parseBoolean()
 	case 'n':
+		n.Type = Null
 		n.parseNull()
 	case '-', '+', '.', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'I', 'N':
 		n.Type = Number
@@ -435,7 +444,6 @@ func (n *Node) parseBoolean() {
 }
 
 func (n *Node) parseNull() {
-	n.Type = Null
 	if n.parseIdx+4 <= len(n.raw) && strings.EqualFold(n.raw[n.parseIdx:n.parseIdx+4], "null") {
 		n.Val = "null"
 		n.parseIdx += len(n.Val)
@@ -727,9 +735,9 @@ func parsePath(path string) parsedPath {
 		return parsedPath{PathNoe: make([]string, 0)}
 	}
 	pPath := parsedPath{PathNoe: pathList}
-	if pathList[0] == Root {
+	if pathList[0] == Root || (len(pathList) == 1 && pathList[0] == "") {
 		pPath.Root = true
-		pathList = pathList[1:]
+		pPath.PathNoe = pathList[1:]
 	}
 	return pPath
 }
