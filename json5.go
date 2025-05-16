@@ -53,6 +53,13 @@ func (db dataBlock) Is(multiTyp int32) bool {
 	return db.Typ&multiTyp != 0
 }
 
+func (db dataBlock) KeyUnQuot() string {
+	if db.Typ != dataTypeKey {
+		return db.Val
+	}
+	return strings.Trim(db.Val, quot)
+}
+
 type Type int
 
 const (
@@ -76,21 +83,29 @@ type Node struct {
 	raw    string // 原始未解析值，用于懒解析
 	parsed bool   // 是否已经解析过了
 
-	Type     Type             // 类型
+	typ      Type             // 类型
 	block    []dataBlock      // 解析数据块
-	Val      string           // 解析后的值部分(不含注释的raw)
+	val      string           // 解析后的值部分(不含注释的raw)
 	children map[string]*Node // 子节点元素信息,仅Object结构
 
 	parseIdx int   // 当前解析位置
-	Err      error // 解析失败信息
+	err      error // 解析失败信息
 }
 
 func New(json string) *Node {
 	return &Node{raw: json}
 }
 
+func (n *Node) Type() Type {
+	return n.parse().typ
+}
+
+func (n *Node) Value() string {
+	return n.parse().val
+}
+
 func (n *Node) Error() error {
-	return n.Err
+	return n.err
 }
 
 func (n *Node) exceptLineBreak(pos int) bool {
@@ -117,7 +132,7 @@ func (n *Node) parse() *Node {
 	}
 	n.parsed = true
 parse:
-	if n.Err != nil {
+	if n.err != nil {
 		return n
 	}
 	var skipLB, containsLB bool
@@ -129,37 +144,37 @@ parse:
 	}
 	switch n.raw[n.parseIdx] {
 	case backslash:
-		containsLB = n.parseComment(true, skipLB || containsLB)
+		containsLB, _ = n.parseComment(true, skipLB || containsLB)
 		goto parse
 	case '{':
-		n.Type = Object
+		n.typ = Object
 		n.children = make(map[string]*Node)
 		n.parseObject()
 	case '[':
-		n.Type = Array
+		n.typ = Array
 		n.parseCombineEnd(arrayPair)
 	case '"', '\'':
-		n.Type = String
+		n.typ = String
 		n.parseString()
 	case 't', 'f':
-		n.Type = Boolean
+		n.typ = Boolean
 		n.parseBoolean()
 	case 'n':
-		n.Type = Null
+		n.typ = Null
 		n.parseNull()
 	case '-', '+', '.', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'I', 'N':
-		n.Type = Number
+		n.typ = Number
 		n.parseNumber()
 	default:
 		n.parseErr(n.parseIdx)
 	}
-	if n.Err != nil {
+	if n.err != nil {
 		return n
 	}
 	containsVal := startIdx < n.parseIdx
-	if n.Type != Object && containsVal { // Object函数内已经追加过了
+	if n.typ != Object && containsVal { // Object函数内已经追加过了
 		n.block = append(n.block, dataBlock{Typ: dataTypeVal})
-		n.Val = n.raw[startIdx:n.parseIdx]
+		n.val = n.raw[startIdx:n.parseIdx]
 	}
 	// 末尾逗号
 	n.parseIdx = skipLineWhiteSpace(n.raw, n.parseIdx)
@@ -174,26 +189,26 @@ parse:
 	}
 	containsLB = false
 	// 处理注释
-	for n.Err == nil && n.parseIdx < len(n.raw) {
+	for n.err == nil && n.parseIdx < len(n.raw) {
 		n.parseIdx, skipLB = skipWhiteSpace(n.raw, n.parseIdx)
 		if !n.except(backslash) {
 			n.parseErr(n.parseIdx)
 			break
 		}
-		containsLB = n.parseComment(true, skipLB || containsLB)
+		containsLB, _ = n.parseComment(true, skipLB || containsLB)
 	}
 	return n
 }
 
 func (n *Node) parseErr(parseIdx int) {
-	n.Err = fmt.Errorf(errParseJsonErrorTmpl, parseIdx, trimStringPart(n.raw, parseIdx, errTrimStringPartLen))
+	n.err = fmt.Errorf(errParseJsonErrorTmpl, parseIdx, trimStringPart(n.raw, parseIdx, errTrimStringPartLen))
 }
 
 // parseComment 解析注释，返回解析后的位置
-func (n *Node) parseComment(wBlock bool, isNotInLine bool) (endWithLB bool) {
+func (n *Node) parseComment(wBlock bool, isNotInLine bool) (endWithLB bool, suc bool) {
 	pos := n.parseIdx
 	if pos+1 >= len(n.raw) {
-		n.Err = fmt.Errorf(errParseJsonErrorTmpl, pos+1, trimStringPart(n.raw, pos, errTrimStringPartLen))
+		n.err = fmt.Errorf(errParseJsonErrorTmpl, pos+1, trimStringPart(n.raw, pos, errTrimStringPartLen))
 		return
 	}
 	var endIdx int
@@ -209,7 +224,7 @@ func (n *Node) parseComment(wBlock bool, isNotInLine bool) (endWithLB bool) {
 	case '*':
 		endIdx = strings.Index(n.raw[pos+2:], "*/")
 		if endIdx == -1 {
-			n.Err = fmt.Errorf(errParseJsonErrorTmpl, pos+1, trimStringPart(n.raw, pos, errTrimStringPartLen))
+			n.err = fmt.Errorf(errParseJsonErrorTmpl, pos+1, trimStringPart(n.raw, pos, errTrimStringPartLen))
 			return
 		}
 		skipWhitePos := skipLineWhiteSpace(n.raw, endIdx)
@@ -220,10 +235,11 @@ func (n *Node) parseComment(wBlock bool, isNotInLine bool) (endWithLB bool) {
 			n.parseIdx = pos + 2 + endIdx + 2
 		}
 	default:
-		n.Err = fmt.Errorf(errParseJsonErrorTmpl, pos+1, trimStringPart(n.raw, pos, errTrimStringPartLen))
+		n.parseIdx++
+		return endWithLB, false
 	}
 	if !wBlock {
-		return
+		return endWithLB, true
 	}
 	typ := dataTypeCommentLine
 	if isNotInLine {
@@ -233,7 +249,7 @@ func (n *Node) parseComment(wBlock bool, isNotInLine bool) (endWithLB bool) {
 		Typ: typ,
 		Val: n.raw[pos:n.parseIdx],
 	})
-	return
+	return endWithLB, true
 }
 
 func (n *Node) parseObject() {
@@ -245,8 +261,8 @@ func (n *Node) parseObject() {
 	if n.exceptLineBreak(pos) {
 		n.block = append(n.block, dataBlock{Typ: dataTypeLineBreak})
 	}
-	parseKey := ""
-	for n.parseIdx < len(n.raw) && n.Err == nil {
+	keyBlock := dataBlock{Typ: dataTypeKey}
+	for n.parseIdx < len(n.raw) && n.err == nil {
 		n.parseIdx, skipLB = skipWhiteSpace(n.raw, n.parseIdx)
 		if n.raw[n.parseIdx] != backslash {
 			containsLB = false
@@ -257,7 +273,7 @@ func (n *Node) parseObject() {
 			n.block = append(n.block, dataBlock{Typ: dataTypeEndFlag})
 			return
 		case backslash:
-			containsLB = n.parseComment(true, containsLB || skipLB)
+			containsLB, _ = n.parseComment(true, containsLB || skipLB)
 			continue
 		case colon:
 			n.parseIdx++
@@ -271,23 +287,27 @@ func (n *Node) parseObject() {
 		startIdx := n.parseIdx
 		var block dataBlock
 		// 判断当前是否解析了key
-		if parseKey == "" { // 尝试获取到key
+		if keyBlock.Val == "" { // 尝试获取到key
 			n.parseObjectKey()
 			block = dataBlock{Typ: dataTypeKey}
 		} else {
 			n.parseObjectVal()
 			block = dataBlock{Typ: dataTypeVal}
 		}
-		if n.Err != nil {
+		if n.err != nil {
 			return
 		}
 		switch block.Typ {
 		case dataTypeKey:
-			parseKey = n.raw[startIdx:n.parseIdx]
-			block.Val = parseKey
+			keyBlock.Val = n.raw[startIdx:n.parseIdx]
+			block.Val = keyBlock.Val
+			if _, ok := n.children[block.KeyUnQuot()]; ok {
+				n.parseErr(n.parseIdx)
+				return // 重复的key
+			}
 		case dataTypeVal:
-			n.children[strings.Trim(parseKey, quot)] = &Node{raw: n.raw[startIdx:n.parseIdx]}
-			parseKey = ""
+			n.children[keyBlock.KeyUnQuot()] = &Node{raw: n.raw[startIdx:n.parseIdx]}
+			keyBlock.Val = ""
 		}
 		n.block = append(n.block, block)
 		if block.Typ == dataTypeVal { // 是否直接换行
@@ -352,7 +372,7 @@ func (n *Node) parseCombineEnd(pair [2]byte) {
 	// 寻找对应的结束位置
 	leftFlagNum := 1
 	n.parseIdx++
-	for n.parseIdx < len(n.raw) && leftFlagNum > 0 && n.Err == nil {
+	for n.parseIdx < len(n.raw) && leftFlagNum > 0 && n.err == nil {
 		switch n.raw[n.parseIdx] {
 		case backslash:
 			n.parseComment(false, false)
@@ -364,7 +384,7 @@ func (n *Node) parseCombineEnd(pair [2]byte) {
 		}
 		n.parseIdx++
 	}
-	if n.Err != nil {
+	if n.err != nil {
 		return
 	}
 	if leftFlagNum > 0 {
@@ -381,7 +401,7 @@ func (n *Node) parseString() {
 			continue
 		}
 		if json[i] == '"' {
-			n.Val = json[n.parseIdx : i+1]
+			n.val = json[n.parseIdx : i+1]
 			n.parseIdx = i + 1
 			return
 		}
@@ -405,7 +425,7 @@ func (n *Node) parseString() {
 							continue
 						}
 					}
-					n.Val = json[n.parseIdx : i+1]
+					n.val = json[n.parseIdx : i+1]
 					n.parseIdx = i + 1
 					return
 				}
@@ -416,7 +436,7 @@ func (n *Node) parseString() {
 			} else {
 				ret = json[:i]
 			}
-			n.Val = ret
+			n.val = ret
 			n.parseIdx = i + 1
 			return
 		}
@@ -439,14 +459,14 @@ func (n *Node) parseBoolean() {
 		n.parseErr(n.parseIdx)
 		return
 	}
-	n.Val = checkVal
+	n.val = checkVal
 	n.parseIdx += len(checkVal)
 }
 
 func (n *Node) parseNull() {
 	if n.parseIdx+4 <= len(n.raw) && strings.EqualFold(n.raw[n.parseIdx:n.parseIdx+4], "null") {
-		n.Val = "null"
-		n.parseIdx += len(n.Val)
+		n.val = "null"
+		n.parseIdx += len(n.val)
 		return
 	}
 	n.parseErr(n.parseIdx)
@@ -464,8 +484,8 @@ func (n *Node) parseNumber() {
 }
 
 func (n *Node) Pretty() string {
-	if n.Err != nil {
-		return n.Err.Error()
+	if n.err != nil {
+		return n.err.Error()
 	}
 	buf := &strings.Builder{}
 	buf.Grow(len(n.raw))
@@ -488,7 +508,7 @@ func buildNodeData(buf *strings.Builder, node *Node, level int) {
 		case dataTypeCommentLine:
 			buf.WriteString(block.Val)
 		case dataTypeStartFlag:
-			switch node.Type {
+			switch node.typ {
 			case Object:
 				buf.WriteByte(objectPair[0])
 			case Array:
@@ -506,8 +526,8 @@ func buildNodeData(buf *strings.Builder, node *Node, level int) {
 			buf.WriteByte(colon)
 			buf.WriteByte(space)
 		case dataTypeVal:
-			if node.Type != Object {
-				buf.WriteString(node.Val)
+			if node.typ != Object {
+				buf.WriteString(node.val)
 				continue
 			}
 			buildNodeData(buf, node.children[preKey], level)
@@ -521,7 +541,7 @@ func buildNodeData(buf *strings.Builder, node *Node, level int) {
 		case dataTypeEndFlag:
 			level--
 			buf.Write(bytes.Repeat(placeholder, level))
-			switch node.Type {
+			switch node.typ {
 			case Object:
 				buf.WriteByte(objectPair[1])
 			case Array:
@@ -542,17 +562,29 @@ func nextBlockIs(node *Node, idx int, typ int32) bool {
 
 func (n *Node) Exists(path string) bool {
 	node := n.Get(path)
-	return node.Type != None
+	return node.typ != None
+}
+
+func (n *Node) IsExist() bool {
+	return n.Type() != None
+}
+
+func (n *Node) IsArray() bool {
+	return n.parse().typ == Array
+}
+
+func (n *Node) IsObject() bool {
+	return n.parse().typ == Object
 }
 
 func (n *Node) Get(path string) *Node {
 	pPath := parsePath(path)
-	if pPath.OnlyRoot() {
+	if pPath.onlyRoot() {
 		return n
 	}
 	pathNode := n
 	for _, nodePath := range pPath.PathNoe {
-		if n.Err = pathNode.parse().Error(); n.Err != nil {
+		if n.err = pathNode.parse().Error(); n.err != nil {
 			return &Node{}
 		}
 		node, ok := pathNode.children[nodePath]
@@ -561,7 +593,7 @@ func (n *Node) Get(path string) *Node {
 		}
 		pathNode = node
 	}
-	if n.Err = pathNode.parse().Error(); n.Err != nil {
+	if n.err = pathNode.parse().Error(); n.err != nil {
 		return &Node{}
 	}
 	return pathNode
@@ -569,7 +601,7 @@ func (n *Node) Get(path string) *Node {
 
 func (n *Node) Delete(path string) *Node {
 	pPath := parsePath(path)
-	if pPath.OnlyRoot() {
+	if pPath.onlyRoot() {
 		*n = Node{raw: "", parsed: false}
 		return n
 	}
@@ -577,7 +609,7 @@ func (n *Node) Delete(path string) *Node {
 	pathDepth := len(pPath.PathNoe)
 	pathNode := n
 	for depth, nodePath := range pPath.PathNoe {
-		if n.Err = pathNode.parse().Error(); n.Err != nil {
+		if n.err = pathNode.parse().Error(); n.err != nil {
 			return n
 		}
 		node, ok := pathNode.children[nodePath]
@@ -603,7 +635,7 @@ func (n *Node) insertObjectNode(nodePath string, node *Node) *Node {
 		endFlagIdx--
 	}
 	if endFlagIdx < 0 {
-		n.Err = errors.New("inner error: end flag not found")
+		n.err = errors.New("inner error: end flag not found")
 		return n
 	}
 	// 插入新增的block
@@ -632,11 +664,11 @@ func (n *Node) deleteObjectNode(nodePath string) *Node {
 	if !ok {
 		return n
 	}
-	// delete(n.children, nodePath)
+	delete(n.children, nodePath)
 	// 删除关联的block信息
 	keyIdx := 0
 	for ; keyIdx < len(n.block); keyIdx++ {
-		if n.block[keyIdx].Typ == dataTypeKey && strings.Trim(n.block[keyIdx].Val, quot) == nodePath {
+		if n.block[keyIdx].Typ == dataTypeKey && n.block[keyIdx].KeyUnQuot() == nodePath {
 			break
 		}
 	}
@@ -668,7 +700,7 @@ func (n *Node) Set(path string, val any) *Node {
 	// val根据类型序列化
 	data, err := json.Marshal(val)
 	if err != nil {
-		n.Err = fmt.Errorf("marshal data error:%w", err)
+		n.err = fmt.Errorf("marshal data error:%w", err)
 		return n
 	}
 	return n.SetString(path, string(data))
@@ -676,7 +708,7 @@ func (n *Node) Set(path string, val any) *Node {
 
 func (n *Node) SetString(path string, val string) *Node {
 	pPath := parsePath(path)
-	if pPath.OnlyRoot() {
+	if pPath.onlyRoot() {
 		*n = Node{raw: val, parsed: false}
 		return n
 	}
@@ -684,11 +716,11 @@ func (n *Node) SetString(path string, val string) *Node {
 	pathNode := n
 	for i, nodePath := range pPath.PathNoe {
 		if pathNode.parse().Error() != nil {
-			n.Err = pathNode.Err
+			n.err = pathNode.err
 			return n
 		}
-		if pathNode.Type != Object {
-			n.Err = errors.New("path not found")
+		if pathNode.typ != Object {
+			n.err = errors.New("path not found")
 			return n
 		}
 		node, ok := pathNode.children[nodePath]
@@ -711,7 +743,7 @@ func (n *Node) SetString(path string, val string) *Node {
 func buildObjectNode() *Node {
 	return &Node{
 		parsed:   true,
-		Type:     Object,
+		typ:      Object,
 		children: map[string]*Node{},
 		block: []dataBlock{
 			{Typ: dataTypeStartFlag},
@@ -725,7 +757,7 @@ type parsedPath struct {
 	PathNoe []string
 }
 
-func (pp parsedPath) OnlyRoot() bool {
+func (pp parsedPath) onlyRoot() bool {
 	return pp.Root && len(pp.PathNoe) == 0
 }
 
@@ -740,4 +772,23 @@ func parsePath(path string) parsedPath {
 		pPath.PathNoe = pathList[1:]
 	}
 	return pPath
+}
+
+func (n *Node) ForEach(iterator func(key string, value *Node) bool) {
+	if n.parse().Error() != nil {
+		return
+	}
+	if n.typ != Object {
+		iterator("", n)
+		return
+	}
+	for _, blockInfo := range n.block {
+		if blockInfo.Typ != dataTypeKey {
+			continue
+		}
+		rawKey := blockInfo.KeyUnQuot()
+		if !iterator(rawKey, n.children[rawKey]) {
+			return
+		}
+	}
 }
