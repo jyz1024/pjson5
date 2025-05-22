@@ -85,7 +85,7 @@ type Node struct {
 
 	typ      Type             // 类型
 	block    []dataBlock      // 解析数据块
-	val      string           // 解析后的值部分(不含注释的raw)
+	val      string           // 解析后的值部分(对于非数组/对象类型为不含注释的raw，数组对象类型为开始位置到结束位置之间的值)
 	children map[string]*Node // 子节点元素信息,仅Object结构
 
 	parseIdx int   // 当前解析位置
@@ -101,7 +101,10 @@ func (n *Node) Type() Type {
 }
 
 func (n *Node) Value() string {
-	return n.parse().val
+	if n.parsed {
+		return n.val
+	}
+	return n.raw
 }
 
 func (n *Node) Error() error {
@@ -171,8 +174,7 @@ parse:
 	if n.err != nil {
 		return n
 	}
-	containsVal := startIdx < n.parseIdx
-	if n.typ != Object && containsVal { // Object函数内已经追加过了
+	if n.typ != Object && startIdx < n.parseIdx {
 		n.block = append(n.block, dataBlock{Typ: dataTypeVal})
 		n.val = n.raw[startIdx:n.parseIdx]
 	}
@@ -253,6 +255,7 @@ func (n *Node) parseComment(wBlock bool, isNotInLine bool) (endWithLB bool, suc 
 }
 
 func (n *Node) parseObject() {
+	objStartIdx := n.parseIdx
 	n.parseIdx++
 	n.block = append(n.block, dataBlock{Typ: dataTypeStartFlag})
 
@@ -271,6 +274,7 @@ func (n *Node) parseObject() {
 		case '}':
 			n.parseIdx++
 			n.block = append(n.block, dataBlock{Typ: dataTypeEndFlag})
+			n.val = n.raw[objStartIdx:n.parseIdx]
 			return
 		case backslash:
 			containsLB, _ = n.parseComment(true, containsLB || skipLB)
@@ -302,7 +306,7 @@ func (n *Node) parseObject() {
 			keyBlock.Val = n.raw[startIdx:n.parseIdx]
 			block.Val = keyBlock.Val
 			if _, ok := n.children[block.KeyUnQuot()]; ok {
-				n.parseErr(n.parseIdx)
+				n.err = errors.New("repeat key:" + block.KeyUnQuot())
 				return // 重复的key
 			}
 		case dataTypeVal:
@@ -394,29 +398,28 @@ func (n *Node) parseCombineEnd(pair [2]byte) {
 }
 
 func (n *Node) parseString() {
-	json := n.raw
+	rawStr := n.raw
 	// expects that the lead character is a '"'
-	for i := n.parseIdx + 1; i < len(json); i++ {
-		if json[i] > '\\' {
+	for i := n.parseIdx + 1; i < len(rawStr); i++ {
+		if rawStr[i] > '\\' {
 			continue
 		}
-		if json[i] == '"' {
-			n.val = json[n.parseIdx : i+1]
+		if rawStr[i] == '"' {
 			n.parseIdx = i + 1
 			return
 		}
-		if json[i] == '\\' {
+		if rawStr[i] == '\\' {
 			i++
-			for ; i < len(json); i++ {
-				if json[i] > '\\' {
+			for ; i < len(rawStr); i++ {
+				if rawStr[i] > '\\' {
 					continue
 				}
-				if json[i] == '"' {
+				if rawStr[i] == '"' {
 					// look for an escaped slash
-					if json[i-1] == '\\' {
+					if rawStr[i-1] == '\\' {
 						n := 0
 						for j := i - 2; j > 0; j-- {
-							if json[j] != '\\' {
+							if rawStr[j] != '\\' {
 								break
 							}
 							n++
@@ -425,23 +428,19 @@ func (n *Node) parseString() {
 							continue
 						}
 					}
-					n.val = json[n.parseIdx : i+1]
 					n.parseIdx = i + 1
 					return
 				}
 			}
-			var ret string
-			if i+1 < len(json) {
-				ret = json[:i+1]
+			if i+1 < len(rawStr) {
+				n.parseIdx = i + 1
 			} else {
-				ret = json[:i]
+				n.parseIdx = i
 			}
-			n.val = ret
-			n.parseIdx = i + 1
 			return
 		}
 	}
-	n.parseErr(len(json) - 1)
+	n.parseErr(len(rawStr) - 1)
 }
 
 func (n *Node) parseBoolean() {
@@ -459,13 +458,11 @@ func (n *Node) parseBoolean() {
 		n.parseErr(n.parseIdx)
 		return
 	}
-	n.val = checkVal
 	n.parseIdx += len(checkVal)
 }
 
 func (n *Node) parseNull() {
 	if n.parseIdx+4 <= len(n.raw) && strings.EqualFold(n.raw[n.parseIdx:n.parseIdx+4], "null") {
-		n.val = "null"
 		n.parseIdx += len(n.val)
 		return
 	}
