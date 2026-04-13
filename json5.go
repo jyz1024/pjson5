@@ -57,7 +57,9 @@ func (db dataBlock) KeyUnQuot() string {
 	if db.Typ != dataTypeKey {
 		return db.Val
 	}
-	return strings.Trim(db.Val, quot)
+	s := strings.Trim(db.Val, quot)
+	s = strings.Trim(s, "'")
+	return s
 }
 
 type Type int
@@ -155,7 +157,8 @@ parse:
 		n.parseObject()
 	case '[':
 		n.typ = Array
-		n.parseCombineEnd(arrayPair)
+		n.children = make(map[string]*Node)
+		n.parseArray()
 	case '"', '\'':
 		n.typ = String
 		n.parseString()
@@ -174,7 +177,7 @@ parse:
 	if n.err != nil {
 		return n
 	}
-	if n.typ != Object && startIdx < n.parseIdx {
+	if n.typ != Object && n.typ != Array && startIdx < n.parseIdx {
 		n.block = append(n.block, dataBlock{Typ: dataTypeVal})
 		n.val = n.raw[startIdx:n.parseIdx]
 	}
@@ -328,14 +331,68 @@ func (n *Node) parseObject() {
 	}
 }
 
+func (n *Node) parseArray() {
+	arrStartIdx := n.parseIdx
+	n.parseIdx++
+	n.block = append(n.block, dataBlock{Typ: dataTypeStartFlag})
+
+	var containsLB, skipLB bool
+	pos := skipLineWhiteSpace(n.raw, n.parseIdx)
+	if n.exceptLineBreak(pos) {
+		n.block = append(n.block, dataBlock{Typ: dataTypeLineBreak})
+	}
+
+	elemIdx := 0
+	for n.parseIdx < len(n.raw) && n.err == nil {
+		n.parseIdx, skipLB = skipWhiteSpace(n.raw, n.parseIdx)
+		if n.parseIdx >= len(n.raw) {
+			break
+		}
+		if n.raw[n.parseIdx] != backslash {
+			containsLB = false
+		}
+		switch n.raw[n.parseIdx] {
+		case ']':
+			n.parseIdx++
+			n.block = append(n.block, dataBlock{Typ: dataTypeEndFlag})
+			n.val = n.raw[arrStartIdx:n.parseIdx]
+			return
+		case backslash:
+			containsLB, _ = n.parseComment(true, containsLB || skipLB)
+			continue
+		}
+		startIdx := n.parseIdx
+		n.parseObjectVal()
+		if n.err != nil {
+			return
+		}
+		key := strconv.Itoa(elemIdx)
+		n.children[key] = &Node{raw: n.raw[startIdx:n.parseIdx]}
+		elemIdx++
+		n.block = append(n.block, dataBlock{Typ: dataTypeVal, Val: key})
+		// eagerly consume trailing comma
+		n.parseIdx = skipLineWhiteSpace(n.raw, n.parseIdx)
+		if n.except(comma) {
+			n.block = append(n.block, dataBlock{Typ: dataTypeComma})
+			n.parseIdx++
+		}
+		// record line break after element/comma
+		n.parseIdx, skipLB = skipWhiteSpace(n.raw, n.parseIdx)
+		if skipLB {
+			n.block = append(n.block, dataBlock{Typ: dataTypeLineBreak})
+		}
+	}
+	n.parseErr(n.parseIdx)
+}
+
 func (n *Node) parseObjectKey() {
 	// key中间不允许插入注释
 	var endFn func(ch byte) bool
 	skipCharNum := 0
-	if n.raw[n.parseIdx] == '"' {
-		// 找到结束引号的位置
+	if n.raw[n.parseIdx] == '"' || n.raw[n.parseIdx] == '\'' {
+		quotCh := n.raw[n.parseIdx]
 		endFn = func(ch byte) bool {
-			return ch == '"'
+			return ch == quotCh
 		}
 		skipCharNum = 1
 	} else {
@@ -399,12 +456,12 @@ func (n *Node) parseCombineEnd(pair [2]byte) {
 
 func (n *Node) parseString() {
 	rawStr := n.raw
-	// expects that the lead character is a '"'
+	quotCh := rawStr[n.parseIdx] // opening quote: '"' or '\''
 	for i := n.parseIdx + 1; i < len(rawStr); i++ {
 		if rawStr[i] > '\\' {
 			continue
 		}
-		if rawStr[i] == '"' {
+		if rawStr[i] == quotCh {
 			n.parseIdx = i + 1
 			return
 		}
@@ -414,17 +471,17 @@ func (n *Node) parseString() {
 				if rawStr[i] > '\\' {
 					continue
 				}
-				if rawStr[i] == '"' {
+				if rawStr[i] == quotCh {
 					// look for an escaped slash
 					if rawStr[i-1] == '\\' {
-						n := 0
+						cnt := 0
 						for j := i - 2; j > 0; j-- {
 							if rawStr[j] != '\\' {
 								break
 							}
-							n++
+							cnt++
 						}
-						if n%2 == 0 {
+						if cnt%2 == 0 {
 							continue
 						}
 					}
@@ -463,7 +520,7 @@ func (n *Node) parseBoolean() {
 
 func (n *Node) parseNull() {
 	if n.parseIdx+4 <= len(n.raw) && strings.EqualFold(n.raw[n.parseIdx:n.parseIdx+4], "null") {
-		n.parseIdx += len(n.val)
+		n.parseIdx += 4
 		return
 	}
 	n.parseErr(n.parseIdx)
@@ -472,12 +529,30 @@ func (n *Node) parseNull() {
 func (n *Node) parseNumber() {
 	// 通过空白字符或者非有效字符找到结束位置
 	endIdx := n.parseIdx + findEndOfNumber(n.raw[n.parseIdx:])
-	_, err := strconv.ParseFloat(n.raw[n.parseIdx:endIdx], 64)
-	if err != nil {
+	numStr := n.raw[n.parseIdx:endIdx]
+	if !isValidNumber(numStr) {
 		n.parseErr(n.parseIdx)
 		return
 	}
 	n.parseIdx = endIdx
+}
+
+func isValidNumber(s string) bool {
+	// strconv.ParseFloat handles decimal, scientific notation, Inf, NaN
+	if _, err := strconv.ParseFloat(s, 64); err == nil {
+		return true
+	}
+	// handle hex (0x/0X) and octal (0o/0O) integers
+	if _, err := strconv.ParseInt(s, 0, 64); err == nil {
+		return true
+	}
+	// positive-prefixed hex/octal: +0xFF
+	if len(s) > 1 && s[0] == '+' {
+		if _, err := strconv.ParseInt(s[1:], 0, 64); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 func (n *Node) Pretty() string {
@@ -523,14 +598,20 @@ func buildNodeData(buf *strings.Builder, node *Node, level int) {
 			buf.WriteByte(colon)
 			buf.WriteByte(space)
 		case dataTypeVal:
-			if node.typ != Object {
+			switch node.typ {
+			case Object:
+				buildNodeData(buf, node.children[preKey], level)
+			case Array:
+				if arrayIsMultiLine(node) {
+					buf.Write(bytes.Repeat(placeholder, level))
+				}
+				buildNodeData(buf, node.children[block.Val], level)
+			default:
 				buf.WriteString(node.val)
-				continue
 			}
-			buildNodeData(buf, node.children[preKey], level)
 		case dataTypeComma:
 			buf.WriteByte(comma)
-			if nextBlockIs(node, idx, dataTypeKey) {
+			if nextBlockIs(node, idx, dataTypeKey) || (arrayIsMultiLine(node) && nextBlockIs(node, idx, dataTypeVal)) {
 				buf.WriteString(lineBreak)
 			} else {
 				buf.WriteByte(space)
@@ -548,6 +629,12 @@ func buildNodeData(buf *strings.Builder, node *Node, level int) {
 			buf.WriteString(lineBreak)
 		}
 	}
+}
+
+// arrayIsMultiLine reports whether an Array node uses multi-line formatting
+// (i.e. the first block after the opening '[' is a line break).
+func arrayIsMultiLine(node *Node) bool {
+	return node.typ == Array && len(node.block) >= 2 && node.block[1].Typ == dataTypeLineBreak
 }
 
 func nextBlockIs(node *Node, idx int, typ int32) bool {
@@ -617,7 +704,11 @@ func (n *Node) Delete(path string) *Node {
 			pathNode = node
 			continue
 		}
-		pathNode.deleteObjectNode(nodePath)
+		if pathNode.typ == Array {
+			pathNode.deleteArrayNode(nodePath)
+		} else {
+			pathNode.deleteObjectNode(nodePath)
+		}
 	}
 	return n
 }
@@ -716,15 +807,25 @@ func (n *Node) SetString(path string, val string) *Node {
 			n.err = pathNode.err
 			return n
 		}
-		if pathNode.typ != Object {
+		if pathNode.typ != Object && pathNode.typ != Array {
 			n.err = errors.New("path not found")
 			return n
 		}
 		node, ok := pathNode.children[nodePath]
 		if !ok {
-			node = buildObjectNode()
-			pathNode.children[nodePath] = node
-			pathNode.insertObjectNode(nodePath, node)
+			if pathNode.typ == Array {
+				targetIdx, atoiErr := strconv.Atoi(nodePath)
+				if atoiErr != nil || targetIdx != len(pathNode.children) {
+					n.err = fmt.Errorf("array index out of range: %s", nodePath)
+					return n
+				}
+				node = &Node{raw: "", parsed: false}
+				pathNode.insertArrayNode(node)
+			} else {
+				node = buildObjectNode()
+				pathNode.children[nodePath] = node
+				pathNode.insertObjectNode(nodePath, node)
+			}
 		}
 		pathNode = node
 		if i != len(pPath.PathNoe)-1 {
@@ -733,6 +834,99 @@ func (n *Node) SetString(path string, val string) *Node {
 		// 最后一个节点，直接赋值
 		pathNode.raw = val
 		pathNode.parsed = false
+	}
+	return n
+}
+
+func (n *Node) Len() int {
+	if n.parse().typ != Array {
+		return 0
+	}
+	return len(n.children)
+}
+
+func (n *Node) insertArrayNode(node *Node) *Node {
+	idx := strconv.Itoa(len(n.children))
+	n.children[idx] = node
+	endFlagIdx := len(n.block) - 1
+	for endFlagIdx >= 0 {
+		if n.block[endFlagIdx].Typ == dataTypeEndFlag {
+			break
+		}
+		endFlagIdx--
+	}
+	if endFlagIdx < 0 {
+		n.err = errors.New("inner error: end flag not found")
+		return n
+	}
+	insertBlocks := []dataBlock{
+		{Typ: dataTypeVal, Val: idx},
+		{Typ: dataTypeLineBreak},
+	}
+	n.block = append(n.block[:endFlagIdx], append(insertBlocks, n.block[endFlagIdx:]...)...)
+	for i := endFlagIdx - 1; i >= 0; i-- {
+		if n.block[i].Typ == dataTypeComma {
+			break
+		}
+		if n.block[i].Typ == dataTypeVal {
+			n.block = append(n.block[:i+1], append([]dataBlock{{Typ: dataTypeComma}}, n.block[i+1:]...)...)
+			break
+		}
+	}
+	return n
+}
+
+func (n *Node) deleteArrayNode(idxStr string) *Node {
+	_, ok := n.children[idxStr]
+	if !ok {
+		return n
+	}
+	delete(n.children, idxStr)
+	// find the Val block for this index
+	valIdx := -1
+	for i, block := range n.block {
+		if block.Typ == dataTypeVal && block.Val == idxStr {
+			valIdx = i
+			break
+		}
+	}
+	if valIdx < 0 {
+		return n
+	}
+	// include the preceding LB in the deletion range (preserves multi-line formatting)
+	startIdx := valIdx
+	if valIdx > 0 && n.block[valIdx-1].Typ == dataTypeLineBreak {
+		startIdx = valIdx - 1
+	}
+	// consume the trailing comma (if any)
+	endIdx := valIdx + 1
+	for endIdx < len(n.block) && n.block[endIdx].Typ == dataTypeComma {
+		endIdx++
+	}
+	// if nothing was consumed after val (only EndFlag follows), also delete preceding comma
+	if endIdx == valIdx+1 && startIdx == valIdx && startIdx > 0 && n.block[startIdx-1].Typ == dataTypeComma {
+		startIdx--
+	}
+	n.block = append(n.block[:startIdx], n.block[endIdx:]...)
+	// re-index: rename keys > deletedIdx by decrementing
+	deletedIdx, _ := strconv.Atoi(idxStr)
+	newChildren := make(map[string]*Node, len(n.children))
+	for k, v := range n.children {
+		ki, _ := strconv.Atoi(k)
+		if ki > deletedIdx {
+			newChildren[strconv.Itoa(ki-1)] = v
+		} else {
+			newChildren[k] = v
+		}
+	}
+	n.children = newChildren
+	for i := range n.block {
+		if n.block[i].Typ == dataTypeVal {
+			ki, _ := strconv.Atoi(n.block[i].Val)
+			if ki > deletedIdx {
+				n.block[i].Val = strconv.Itoa(ki - 1)
+			}
+		}
 	}
 	return n
 }
@@ -775,17 +969,28 @@ func (n *Node) ForEach(iterator func(key string, value *Node) bool) {
 	if n.parse().Error() != nil {
 		return
 	}
-	if n.typ != Object {
+	switch n.typ {
+	case Object:
+		for _, blockInfo := range n.block {
+			if blockInfo.Typ != dataTypeKey {
+				continue
+			}
+			rawKey := blockInfo.KeyUnQuot()
+			if !iterator(rawKey, n.children[rawKey]) {
+				return
+			}
+		}
+	case Array:
+		for _, blockInfo := range n.block {
+			if blockInfo.Typ != dataTypeVal {
+				continue
+			}
+			idx := blockInfo.Val
+			if !iterator(idx, n.children[idx]) {
+				return
+			}
+		}
+	default:
 		iterator("", n)
-		return
-	}
-	for _, blockInfo := range n.block {
-		if blockInfo.Typ != dataTypeKey {
-			continue
-		}
-		rawKey := blockInfo.KeyUnQuot()
-		if !iterator(rawKey, n.children[rawKey]) {
-			return
-		}
 	}
 }

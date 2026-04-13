@@ -2,3 +2,6 @@
 .vscode
 .DS_Store
 vendor
+.claude
+.cursor
+.codex
