@@ -435,6 +435,11 @@ func (n *Node) parseCombineEnd(pair [2]byte) {
 	n.parseIdx++
 	for n.parseIdx < len(n.raw) && leftFlagNum > 0 && n.err == nil {
 		switch n.raw[n.parseIdx] {
+		case '"', '\'':
+			// 跳过字符串字面量，避免字符串内的 `/` 被误判为注释开始
+			// （如 URL 中的 `://`），以及字符串内的 `{}`/`[]` 被误计入括号匹配。
+			n.parseString()
+			continue
 		case backslash:
 			n.parseComment(false, false)
 			continue

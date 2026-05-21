@@ -814,3 +814,41 @@ func TestNode_Delete(t *testing.T) {
 		})
 	}
 }
+
+// TestNode_UrlInValueNotTreatedAsComment 回归测试：
+// 之前 parseCombineEnd 不识别字符串边界，会把字符串字面量内的
+// `//`（例如 URL 中的 `://`）误判为行注释，从而跳过同一行后续的
+// 闭合符 `}` / `]`，导致对象/数组 value 的边界被错误扩展，吞掉后续兄弟字段。
+func TestNode_UrlInValueNotTreatedAsComment(t *testing.T) {
+	raw := `{
+  "widget": {
+    "2030": [
+      {"icon": "https://res.weplayapp.com/a.webp?w=84&h=84", "link": "https://x.com/p/index.html"}
+    ],
+    "2040": [ { "icon": "https://res.weplayapp.com/b.webp?w=84&h=84", "link":"https://y.com/p/index.html","name":"榜单"}]
+  },
+  "after_widget": {
+    "k": 1
+  }
+}`
+	node := New(raw)
+	if err := node.parse().Error(); err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if !node.Exists("widget") {
+		t.Fatal("widget should exist")
+	}
+	if !node.Exists("after_widget") {
+		t.Fatal("after_widget should still exist; URL `//` should not swallow following keys")
+	}
+	widget := node.Get("widget")
+	if widget.Error() != nil {
+		t.Fatalf("widget parse error: %v", widget.Error())
+	}
+	if !widget.Exists("2030") || !widget.Exists("2040") {
+		t.Fatal("widget should contain 2030 and 2040")
+	}
+	if !node.Get("after_widget").Exists("k") {
+		t.Fatal("after_widget.k should exist")
+	}
+}
